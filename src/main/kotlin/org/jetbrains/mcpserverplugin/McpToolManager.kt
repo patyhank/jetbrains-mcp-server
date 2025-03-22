@@ -28,7 +28,13 @@ class McpToolManager {
             GetVcsStatusTool(),
             ToggleBreakpointTool(),
             GetBreakpointsTool(),
+            InspectCurrentFileTool(),
+            InspectFileByPathTool(),
+            InsertByPathTool(),
+//            InspectProjectTool(),
+//            ApplyPatchTool(), // Suck Reply
             ReplaceTextByPathTool(),
+//            ReplaceLinesByPathTool(), // Suck Reply
             ListFilesInFolderTool(),
             SearchInFilesContentTool(),
             RunConfigurationTool(),

@@ -1,48 +1,55 @@
 package org.jetbrains.mcpserverplugin
 
+import com.intellij.codeInsight.daemon.impl.HighlightInfo
+import com.intellij.codeInspection.InspectionEngine
+import com.intellij.codeInspection.ex.LocalInspectionToolWrapper
 import com.intellij.execution.ProgramRunnerUtil.executeConfiguration
 import com.intellij.execution.RunManager
 import com.intellij.execution.executors.DefaultRunExecutor.getRunExecutorInstance
 import com.intellij.find.FindManager
 import com.intellij.find.impl.FindInProjectUtil
 import com.intellij.ide.DataManager
+import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.ex.ActionManagerEx
-import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.invokeLater
-import com.intellij.openapi.application.runInEdt
-import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.application.*
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.command.WriteCommandAction.runWriteCommandAction
+import com.intellij.openapi.diff.impl.patch.PatchReader
+import com.intellij.openapi.diff.impl.patch.apply.GenericPatchApplier
 import com.intellij.openapi.editor.Document
+import com.intellij.openapi.editor.impl.DocumentMarkupModel
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorManager.getInstance
+import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.impl.CoreProgressManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.roots.OrderEnumerator
+import com.intellij.openapi.util.TextRange
+import com.intellij.openapi.util.ThrowableComputable
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.readText
 import com.intellij.openapi.vfs.toNioPathOrNull
+import com.intellij.profile.codeInspection.InspectionProjectProfileManager
 import com.intellij.psi.PsiDocumentManager
+import com.intellij.psi.PsiManager
 import com.intellij.psi.search.FilenameIndex
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.usageView.UsageInfo
 import com.intellij.usages.FindUsagesProcessPresentation
 import com.intellij.usages.UsageViewPresentation
+import com.intellij.util.PairProcessor
 import com.intellij.util.Processor
 import com.intellij.util.application
 import com.intellij.util.io.createParentDirectories
 import kotlinx.serialization.Serializable
-import org.apache.commons.compress.utils.TimeUtils
 import org.jetbrains.ide.mcp.NoArgs
 import org.jetbrains.ide.mcp.Response
 import java.nio.file.Path
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.*
 
@@ -66,7 +73,9 @@ class GetCurrentFileTextTool : AbstractMcpTool<NoArgs>() {
 
     override fun handle(project: Project, args: NoArgs): Response {
         val text = runReadAction<String?> {
-            getInstance(project).selectedTextEditor?.document?.text
+            getInstance(project).selectedTextEditor?.document?.text?.lines()
+                ?.mapIndexed { index, line -> "${index + 1}|\t$line" }
+                ?.joinToString("\n")
         }
         return Response(text ?: "")
     }
@@ -105,7 +114,11 @@ class GetAllOpenFileTextsTool : AbstractMcpTool<NoArgs>() {
 
         val fileEditorManager = FileEditorManager.getInstance(project)
         val openFiles = fileEditorManager.openFiles
-        val filePaths = openFiles.mapNotNull { """{"path": "${it.toNioPath().relativizeByProjectDir(projectDir)}", "text": "${it.readText()}", """ }
+        val filePaths = openFiles.mapNotNull {
+            """{"path": "${
+                it.toNioPath().relativizeByProjectDir(projectDir)
+            }", "text": "${it.readText()}", """
+        }
         return Response(filePaths.joinToString(",\n", prefix = "[", postfix = "]"))
     }
 }
@@ -164,6 +177,7 @@ class OpenFileInEditorTool : AbstractMcpTool<OpenFileInEditorArgs>() {
         }
     }
 }
+
 class GetSelectedTextTool : AbstractMcpTool<NoArgs>() {
     override val name: String = "get_selected_in_editor_text"
     override val description: String = """
@@ -214,7 +228,8 @@ class ReplaceSelectedTextTool : AbstractMcpTool<ReplaceSelectedTextArgs>() {
         }
 
         return response ?: Response(error = "unknown error")
-    }}
+    }
+}
 
 @Serializable
 data class ReplaceCurrentFileTextArgs(val text: String)
@@ -337,7 +352,7 @@ data class PathInProject(val pathInProject: String)
 class GetFileTextByPathTool : AbstractMcpTool<PathInProject>() {
     override val name: String = "get_file_text_by_path"
     override val description: String = """
-        Retrieves the text content of a file using its path relative to project root.
+        Retrieves the text content wit line prefixed of a file using its path relative to project root.
         Use this tool to read file contents when you have the file's project-relative path.
         Requires a pathInProject parameter specifying the file location from project root.
         Returns one of these responses:
@@ -357,7 +372,10 @@ class GetFileTextByPathTool : AbstractMcpTool<PathInProject>() {
                 ?: return@runReadAction Response(error = "file not found")
 
             if (GlobalSearchScope.allScope(project).contains(file)) {
-                Response(file.readText())
+                Response(
+                    file.readText().lines()
+                        .mapIndexed { index, line -> "${index + 1}|\t$line" }
+                        .joinToString("\n"))
             } else {
                 Response(error = "file not found")
             }
@@ -366,6 +384,379 @@ class GetFileTextByPathTool : AbstractMcpTool<PathInProject>() {
     }
 }
 
+@Serializable
+data class ApplyPatchArgs(val diffContent: String)
+
+class ApplyPatchTool : AbstractMcpTool<ApplyPatchArgs>() {
+    override val name: String = "apply_patch"
+    override val description: String = """
+        Applies a diff patch to a specified file in the project using IntelliJ's patch engine.
+        Use this tool to modify a file's content using a unified diff format.
+        Requires two parameters:
+        - diffContent: The diff content in unified diff format to apply
+        Returns one of these responses:
+        - "ok" if the patch was successfully applied
+        - error "project dir not found" if project directory cannot be determined
+        - error "file not found" if the file doesn't exist
+        - error "invalid diff format" if the diff content is malformed
+        - error "patch application failed" if applying the patch fails
+        Note: Automatically saves the file after modification
+    """.trimIndent()
+
+    override fun handle(project: Project, args: ApplyPatchArgs): Response {
+        val projectDir = project.guessProjectDir()
+            ?: return Response(error = "project dir not found")
+        val projectDirPath = projectDir.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+
+        // 解析 diff 內容
+        val patchReader: PatchReader
+        try {
+            patchReader = PatchReader(args.diffContent, true)
+            patchReader.parseAllPatches()
+        } catch (e: Exception) {
+            return Response(error = "invalid diff format: ${e.message}")
+        }
+        // 檢查是否有 patch
+        val patches = patchReader.textPatches
+        if (patches.isEmpty()) {
+            return Response(error = "invalid diff format: no patches found")
+        }
+
+// 遍歷並應用每個 patch
+        for (patch in patches) {
+            val filePath = patch.beforeName ?: patch.afterName
+            ?: return Response(error = "invalid diff format: no file path specified in patch")
+
+            // 獲取目標文件
+            val file: VirtualFile = runReadAction {
+                LocalFileSystem.getInstance()
+                    .refreshAndFindFileByNioFile(projectDirPath.resolveRel(filePath))
+                    ?: return@runReadAction null
+            } ?: return Response(error = "file $filePath not found")
+
+            // 獲取當前文件內容
+            val currentContent = runReadAction { file.readText() }
+
+            // 使用 GenericPatchApplier 應用 patch
+            val applier = GenericPatchApplier(currentContent, patch.hunks)
+            val applyResult = applier.execute()
+
+            // 檢查應用結果
+            if (!applyResult) {
+                return Response(error = "conflict detected in $filePath")
+            }
+
+            val newContent = applier.after
+            if (newContent == null || newContent == currentContent) {
+                continue // 無更改，跳到下一個 patch
+            }
+
+            // 在 WriteCommandAction 中更新文件
+            try {
+                WriteCommandAction.runWriteCommandAction(project) {
+                    runWriteAction {
+                        val document = FileDocumentManager.getInstance().getDocument(file)
+                            ?: throw IllegalStateException("Could not get document for $filePath")
+                        document.setText(newContent)
+                        FileDocumentManager.getInstance().saveDocument(document)
+                    }
+                }
+            } catch (e: Exception) {
+                return Response(error = "patch application failed for $filePath: ${e.message}")
+            }
+        }
+        return Response("ok")
+    }
+}
+
+@Serializable
+data class ReplaceLinesByPathToolArgs(val pathInProject: String, val startLine: Int, val endLine: Int, val text: String)
+
+class ReplaceLinesByPathTool : AbstractMcpTool<ReplaceLinesByPathToolArgs>() {
+    override val name: String = "replace_lines_text_by_path"
+    override val description: String = """
+    Replaces the content within a specified range of lines in a target file. If you want insert text to lines, use insert_text_by_path instead of this.
+    The file must be located within the project
+    and is identified by its path relative to the project root. This tool requires the following parameters:
+    - pathInProject: The relative path to the target file.
+    - startLine: The starting line number of the range to be replaced.
+    - endLine: The ending line number of the range to be replaced.
+    - text: The new text to insert in place of the specified line range.
+    Note:
+    - The original content in the specified line range is completely replaced.
+    - If you want the final result to include a newline, you must explicitly include it in the 'text' parameter.
+    Returns:
+    - "ok" if the file was successfully updated.
+    - error "project dir not found" if the project directory cannot be determined.
+    - error "file not found" if the file doesn't exist.
+    - error "could not get document" if the file content cannot be accessed.
+    Note:
+        Note: The file is automatically saved after modification.
+"""
+
+
+    override fun handle(project: Project, args: ReplaceLinesByPathToolArgs): Response {
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+
+        var document: Document? = null
+
+        val readResult = runReadAction {
+            var file: VirtualFile = LocalFileSystem.getInstance()
+                .refreshAndFindFileByNioFile(projectDir.resolveRel(args.pathInProject))
+                ?: return@runReadAction "file not found"
+
+            if (!GlobalSearchScope.allScope(project).contains(file)) {
+                return@runReadAction "file not found"
+            }
+
+            document = FileDocumentManager.getInstance().getDocument(file)
+            if (document == null) {
+                return@runReadAction "could not get document"
+            }
+
+            return@runReadAction "ok"
+        }
+
+        if (readResult != "ok") {
+            return Response(error = readResult)
+        }
+
+        WriteCommandAction.runWriteCommandAction(project) {
+            val startLineIndex = args.startLine - 1
+            val endLineIndex = args.endLine - 1
+
+            // 取得開始與結束偏移量，這裡假設行號合法
+            val startOffset = document!!.getLineStartOffset(startLineIndex)
+            val endOffset = document!!.getLineEndOffset(endLineIndex)
+
+            // 替換指定範圍的文字
+            document!!.replaceString(startOffset, endOffset, args.text)
+
+            // 自動保存修改後的文件
+            FileDocumentManager.getInstance().saveDocument(document!!)
+        }
+
+        return Response("ok")
+    }
+}
+
+@Serializable
+data class InsertByPathToolArgs(val pathInProject: String, val line: Int, val offset: Int, val text: String)
+
+class InsertByPathTool : AbstractMcpTool<InsertByPathToolArgs>() {
+    override val name: String = "insert_text_by_path"
+    override val description: String = """
+    Inserts specified text into a target file at a specific position. The target file must be within the project
+    and is identified by its path relative to the project root. This tool requires the following parameters:
+    - pathInProject: The relative path to the target file.
+    - line: The line number where the text will be inserted.
+    - offset: The character offset from the start of the specified line to determine the insertion point.
+    - text: The text to insert.
+    Returns:
+    - "ok" if the file was successfully updated.
+    - error "project dir not found" if the project directory cannot be determined.
+    - error "file not found" if the file doesn't exist.
+    - error "could not get document" if the file content cannot be accessed.
+    Note: 
+    - The file is automatically saved after the modification.
+    - If a newline is needed at the end of the inserted text, you must include it manually (e.g., end the text content with '\n').
+    """
+
+
+    override fun handle(project: Project, args: InsertByPathToolArgs): Response {
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+
+        var document: Document? = null
+
+        val readResult = runReadAction {
+            var file: VirtualFile = LocalFileSystem.getInstance()
+                .refreshAndFindFileByNioFile(projectDir.resolveRel(args.pathInProject))
+                ?: return@runReadAction "file not found"
+
+            if (!GlobalSearchScope.allScope(project).contains(file)) {
+                return@runReadAction "file not found"
+            }
+
+            document = FileDocumentManager.getInstance().getDocument(file)
+            if (document == null) {
+                return@runReadAction "could not get document"
+            }
+
+            return@runReadAction "ok"
+        }
+
+        if (readResult != "ok") {
+            return Response(error = readResult)
+        }
+
+        WriteCommandAction.runWriteCommandAction(project) {
+            val offset = document!!.getLineStartOffset(args.line - 1) + args.offset
+
+            document!!.insertString(offset, args.text)
+
+            FileDocumentManager.getInstance().saveDocument(document!!)
+        }
+
+        return Response("ok")
+    }
+}
+
+fun runLocalInspections(project: Project, psiFile: com.intellij.psi.PsiFile): List<String> {
+    val document = PsiDocumentManager.getInstance(project).getDocument(psiFile) ?: return emptyList()
+    val markupModel = DocumentMarkupModel.forDocument(document, project, false)
+    return markupModel.allHighlighters.filter { it.errorStripeTooltip is HighlightInfo }.mapNotNull {
+        val highlightInfo = it.errorStripeTooltip as HighlightInfo
+        if (highlightInfo.severity != HighlightSeverity.ERROR) {
+            return@mapNotNull null
+        }
+
+        highlightInfo.description
+    }
+
+//    if (psiFile.textLength == -1) {
+//        return emptyList()
+//    }
+//    val textRange = TextRange(0, psiFile.textLength)
+//    val profile = InspectionProjectProfileManager.getInstance(project).currentProfile
+//
+//    val tools: List<LocalInspectionToolWrapper> = profile.tools.mapNotNull { tools ->
+//        if (tools.tool is LocalInspectionToolWrapper) {
+//            tools.tool as LocalInspectionToolWrapper
+//        } else {
+//            null
+//        }
+//    }
+//
+//    val instance = ProgressManager.getInstance()
+//    return instance.runProcessWithProgressSynchronously(object : ThrowableComputable<List<String>, Exception> {
+//        override fun compute(): List<String> {
+//            return runReadAction {
+//                val result = InspectionEngine.inspectEx(
+//                    tools,
+//                    psiFile,
+//                    textRange,
+//                    textRange,
+//                    false,
+//                    false,
+//                    false,
+//                    ProgressManager.getInstance().progressIndicator,
+//                    PairProcessor.alwaysTrue()
+//                )
+//
+//                result.map { (key, problems) ->
+//                    val problemMessages = problems.map { problem ->
+//                        problem.highlightType
+//                        val range : TextRange? = problem.textRangeInElement
+//                        val content = if (range == null) {
+//                            ""
+//                        } else {
+//                            psiFile.text.substring(range.startOffset, range.endOffset)
+//                        }
+//
+//                        // 將描述中的雙引號跳脫
+//                        val message = problem.descriptionTemplate.replace("\"", "\\\"")
+//                        """{"line": ${problem.lineNumber}, "severity": "${problem.highlightType}", "content": "${
+//                            content.replace(
+//                                "\"",
+//                                "\\\""
+//                            )
+//                        }", "message": "$message"}"""
+//                    }.joinToString(separator = ",\n", prefix = "[", postfix = "]")
+//
+//
+//                    """"${key.displayName}": ${problemMessages}"""
+//                }
+//            }
+//        }
+//    }, "Validating files", true, project)
+}
+
+class InspectCurrentFileTool : AbstractMcpTool<NoArgs>() {
+    override val name: String = "inspect_current_file"
+    override val description: String = """
+        Performs code inspection on the file currently open in the JetBrains IDE editor.
+        Returns a JSON array where each item contains the line number, severity, issue content, and description.
+        If no file is open or there are no issues, it returns an empty array ([]).
+    """.trimIndent()
+
+    override fun handle(project: Project, args: NoArgs): Response {
+        val file = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
+            ?: return Response("[]")
+        val psiFile = PsiManager.getInstance(project).findFile(file) ?: return Response("[]")
+        val issues = runLocalInspections(project, psiFile)
+        return Response(issues.joinToString(separator = ",\n", prefix = "[", postfix = "]"))
+    }
+}
+
+
+@Serializable
+data class InspectFileByPathArgs(val pathInProject: String)
+
+class InspectFileByPathTool : AbstractMcpTool<InspectFileByPathArgs>() {
+    override val name: String = "inspect_file_by_path"
+    override val description: String = """
+        Performs code inspection on a file specified by a relative path within the project.
+        Returns a JSON array where each item contains the line number, severity, issue content, and description.
+        If the file cannot be found or there are no issues, it returns an empty array ([]).
+    """.trimIndent()
+
+    override fun handle(project: Project, args: InspectFileByPathArgs): Response {
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+        val file = LocalFileSystem.getInstance()
+            .refreshAndFindFileByNioFile(projectDir.resolveRel(args.pathInProject))
+            ?:  return Response(error = "file not found")
+        val psiFile = PsiManager.getInstance(project).findFile(file) ?: return Response(error = "psifile not found")
+        val issues = runLocalInspections(project, psiFile)
+        return Response(issues.joinToString(separator = ",\n", prefix = "[", postfix = "]"))
+    }
+}
+
+class InspectProjectTool : AbstractMcpTool<NoArgs>() {
+    override val name: String = "inspect_project"
+    override val description: String = """
+        Performs code inspection on all files within the entire project.
+        Returns a JSON array where each item contains the file path, line number, severity, issue content, and description.
+        If there are no inspection results, it returns an empty array ([]).
+    """.trimIndent()
+
+    override fun handle(project: Project, args: NoArgs): Response {
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+        val scope = GlobalSearchScope.projectScope(project)
+        val fileNames = FilenameIndex.getAllFilenames(project)
+        val files = fileNames.flatMap { name ->
+            FilenameIndex.getVirtualFilesByName(name, scope)
+        }.distinct()
+
+        val allIssues = mutableListOf<String>()
+        val psiManager = PsiManager.getInstance(project)
+        for (file in files) {
+            // Only process files located within the project directory
+            try {
+                projectDir.relativize(Path(file.path))
+            } catch (e: Exception) {
+                continue
+            }
+            val psiFile = psiManager.findFile(file) ?: continue
+            val issues = runLocalInspections(project, psiFile)
+            if (issues.isNotEmpty()) {
+                // Obtain the relative path for easier identification
+                val relativePath = projectDir.relativize(Path(file.path)).toString()
+                issues.forEach { issue ->
+                    // Add the file path to the result (careful with commas in JSON format)
+                    // Assuming the issue format is {"line": ..., ...}, remove the leading '{'
+                    val issueWithoutBrace = issue.removePrefix("{")
+                    allIssues.add("""{"file": "$relativePath", $issueWithoutBrace""")
+                }
+            }
+        }
+        return Response(allIssues.joinToString(separator = ",\n", prefix = "[", postfix = "]"))
+    }
+}
 
 @Serializable
 data class ReplaceTextByPathToolArgs(val pathInProject: String, val text: String)
@@ -567,7 +958,8 @@ class RunConfigurationTool : AbstractMcpTool<RunConfigArgs>() {
 
 class GetProjectModulesTool : AbstractMcpTool<NoArgs>() {
     override val name: String = "get_project_modules"
-    override val description: String = "Get list of all modules in the project with their dependencies. Returns JSON list of module names."
+    override val description: String =
+        "Get list of all modules in the project with their dependencies. Returns JSON list of module names."
 
     override fun handle(project: Project, args: NoArgs): Response {
         val moduleManager = com.intellij.openapi.module.ModuleManager.getInstance(project)
@@ -578,7 +970,8 @@ class GetProjectModulesTool : AbstractMcpTool<NoArgs>() {
 
 class GetProjectDependenciesTool : AbstractMcpTool<NoArgs>() {
     override val name: String = "get_project_dependencies"
-    override val description: String = "Get list of all dependencies defined in the project. Returns JSON list of dependency names."
+    override val description: String =
+        "Get list of all dependencies defined in the project. Returns JSON list of dependency names."
 
     override fun handle(project: Project, args: NoArgs): Response {
         val moduleManager = com.intellij.openapi.module.ModuleManager.getInstance(project)

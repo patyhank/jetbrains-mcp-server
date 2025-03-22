@@ -60,6 +60,10 @@ class MCPService : RestService() {
         classDiscriminator = "schemaType"
     }
 
+    override fun getMaxRequestsPerMinute(): Int {
+        return Int.MAX_VALUE
+    }
+
     override fun getServiceName(): String = serviceName
 
     override fun execute(urlDecoder: QueryStringDecoder, request: FullHttpRequest, context: ChannelHandlerContext): String? {
